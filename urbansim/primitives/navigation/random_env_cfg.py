@@ -71,11 +71,16 @@ class SceneCfg(UrbanSceneCfg):
     # scenario type
     scenario_generation_method: str = "limited sync procedural generation"
     # [sync or async]
+
+    terrain_uv_tile_size_m: float = 1.0
+    random_env_static_asset_max_planar_extent_m: float = 4.0
+    random_env_static_asset_max_height_m: float = 6.0
+    random_env_static_asset_max_xy_offset_m: float = 4.0
     
     # procedural generation config
     pg_config: dict = dict(
         type='dynamic', # [clean, static, dynamic]
-        with_terrain=False,
+        with_terrain=True,
         with_boundary=True,
         map_region=20,
         buffer_width=1,
@@ -145,10 +150,12 @@ class SceneCfg(UrbanSceneCfg):
         ) for i in range(4)
     ]
     terrain_walkable_material_list = [
-        sim_utils.MdlFileCfg(mdl_path=walkable_material_path_list[i], project_uvw=True, texture_scale=1000) for i in range(len(terrain_importer_walkable_list))
+        sim_utils.MdlFileCfg(mdl_path=walkable_material_path_list[i], texture_scale=(1.0, 1.0))
+        for i in range(len(terrain_importer_walkable_list))
     ]
     terrain_non_walkable_material_list = [
-        sim_utils.MdlFileCfg(mdl_path=non_walkable_material_path_list[i], project_uvw=True, texture_scale=1000) for i in range(len(terrain_non_walkable_list))
+        sim_utils.MdlFileCfg(mdl_path=non_walkable_material_path_list[i], texture_scale=(1.0, 1.0))
+        for i in range(len(terrain_non_walkable_list))
     ]
     
     # sensor
@@ -171,7 +178,8 @@ class SceneCfg(UrbanSceneCfg):
     height_scanner = RayCasterCfg(
         prim_path="{ENV_REGEX_NS}/Robot/base",
         offset=RayCasterCfg.OffsetCfg(pos=(0.0, 0.0, 20.0)),
-        attach_yaw_only=True,
+        ray_alignment="yaw",
+        #attach_yaw_only=True,
         pattern_cfg=patterns.GridPatternCfg(resolution=0.1, size=[1.6, 1.0]),
         debug_vis=True,
         mesh_prim_paths=[f"/World/ground"],

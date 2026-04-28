@@ -89,6 +89,7 @@ import contextlib
 import os
 import pickle
 import tqdm
+import json
 
 import carb
 import isaacsim.core.utils.stage as stage_utils
@@ -102,6 +103,33 @@ from pathlib import Path
 
 ROOT_DIR = Path(__file__).parent.parent.parent.parent
 print(f"ROOT_DIR: {ROOT_DIR}")
+
+
+def load_asset_parameter_map(param_dir: str) -> dict[str, list[str]]:
+    """Index parameter json files by the trailing asset id used in object filenames."""
+    parameter_map: dict[str, list[str]] = {}
+    for json_name in os.listdir(param_dir):
+        if not json_name.endswith(".json"):
+            continue
+        asset_id = Path(json_name).stem.split("-")[-1]
+        parameter_map.setdefault(asset_id, []).append(json_name)
+    return parameter_map
+
+
+def resolve_asset_parameters(mesh_path: str, param_dir: str, parameter_map: dict[str, list[str]]) -> tuple[dict, str | None]:
+    """Resolve the calibration json for a mesh, falling back to default parameters when missing."""
+    asset_id = Path(mesh_path).stem.split("_")[-1]
+    matches = parameter_map.get(asset_id, [])
+    if not matches:
+        print(f"[WARNING] No parameter json found for {Path(mesh_path).name}. Falling back to default scale=1.0.")
+        return {}, None
+
+    if len(matches) > 1:
+        print(f"[INFO] Multiple parameter json matches found for {Path(mesh_path).name}: {matches}. Using {matches[0]}.")
+
+    json_name = matches[0]
+    with open(os.path.join(param_dir, json_name), "r") as f:
+        return json.load(f), json_name
 
 def main():
     root_dir = os.path.join(ROOT_DIR, 'assets', 'objects')
@@ -125,7 +153,8 @@ def main():
 
     file_names = [f for f in file_names_parent if '.glb' in f] 
     file_goes = [f.replace('glb', 'usd').replace('assets/objects', 'assets/usds') for f in file_names]
-    file_parameters = os.listdir(os.path.join(ROOT_DIR, 'assets', 'adj_parameter_folder'))
+    param_dir = os.path.join(ROOT_DIR, 'assets', 'adj_parameter_folder')
+    parameter_map = load_asset_parameter_map(param_dir)
     
     if args_cli.mass is not None:
         mass_props = schemas_cfg.MassPropertiesCfg(mass=args_cli.mass)
@@ -139,15 +168,8 @@ def main():
     collision_props = schemas_cfg.CollisionPropertiesCfg(collision_enabled=args_cli.collision_approximation != "none")
     
     mesh_converters_cfgs = []
-    import json
     for mesh_path, mesh_go in zip(file_names, file_goes):
-        for json_f in file_parameters:
-            if mesh_path.split('.')[0].split('_')[-1] in json_f:
-                with open(os.path.join(ROOT_DIR, 'assets', 'adj_parameter_folder', json_f), 'r') as f:
-                    json_data = json.load(f)
-                    break
-        # print(json_data)
-        # break
+        json_data, json_name = resolve_asset_parameters(mesh_path, param_dir, parameter_map)
         # Create Mesh converter config
         mesh_converter_cfg = MeshConverterCfg(
             mass_props=mass_props,
@@ -158,7 +180,9 @@ def main():
             usd_dir=os.path.dirname(mesh_go),
             usd_file_name=os.path.basename(mesh_go),
             make_instanceable=args_cli.make_instanceable,
-            scale=(json_data.get('scale', 1.0), json_data.get('scale', 1.0), json_data.get('scale', 1.0)),
+            # Keep raw geometry scale in the converted USD.
+            # Per-asset scene calibration is applied later when loading the USD in UrbanScene.
+            scale=(1.0, 1.0, 1.0),
             # mesh_collision_props=args_cli.collision_approximation,
         )
         mesh_converters_cfgs.append(mesh_converter_cfg)

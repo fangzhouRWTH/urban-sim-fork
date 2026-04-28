@@ -39,7 +39,11 @@ print("We will install the following packages: ", packages)
 install_requires = [
     "requests",
     "gymnasium>=0.28",
-    "numpy>=1.21.6",
+    "numpy>=1.21.6,<2",
+    "torch>=2.7",
+    "opencv-python<4.12",
+	"open3d<0.20",
+	"scipy<1.16",
     "matplotlib",
     "pandas",
     "pygame",
@@ -53,15 +57,15 @@ install_requires = [
     "manifold3d",
     "pillow",
     "pytest",
-    "opencv-python",
-    "open3d",
     "lxml",
-    "scipy",
     "psutil",
     "geopandas",
     "shapely",
     "filelock",
     "Pygments",
+    "jax==0.4.28",
+	"jaxlib==0.4.28",
+	"chex==0.1.86",
 ]
 
 

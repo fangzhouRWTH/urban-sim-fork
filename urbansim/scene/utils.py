@@ -545,17 +545,27 @@ def get_road_trimesh(x, y, area_size, min_road_width=15, max_road_width=18, heig
     
     return mesh, [upper_boundary, lower_boundary], polyline_points
 
-UV_SCLAE = 20
-def uv_texturing(mesh, scale=UV_SCLAE):
-    uvs = []
-    for vertex in mesh.vertices:
-        uv = [vertex[0], vertex[1]]
-        uvs.append(uv)
-    uvs = np.array(uvs)
-    uvs = (uvs - np.min(uvs)) / (np.max(uvs) - np.min(uvs))
-    uvs *= scale
+DEFAULT_TERRAIN_UV_TILE_SIZE_M = 1.0
+
+
+def uv_texturing(mesh, tile_size_m=DEFAULT_TERRAIN_UV_TILE_SIZE_M):
+    """Assign repeatable world-space UVs to a terrain mesh.
+
+    The previous implementation normalized UVs across the whole combined mesh, which caused
+    large procedural regions to stretch a single texture across the entire surface. Here we
+    tile directly from world X/Y coordinates so texture density remains stable regardless of
+    mesh size.
+    """
+    if tile_size_m <= 0:
+        raise ValueError(f"tile_size_m must be positive, got {tile_size_m!r}")
+
+    if len(mesh.vertices) == 0:
+        return mesh
+
+    vertices = np.asarray(mesh.vertices, dtype=np.float64)
+    uvs = vertices[:, :2] / float(tile_size_m)
     mesh.visual.uvs = uvs
-    
+
     return mesh
 
 # UrbanVerse Utils

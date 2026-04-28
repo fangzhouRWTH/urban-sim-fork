@@ -61,7 +61,7 @@ file(REMOVE_RECURSE
   "CMakeFiles/bind.dir/src/xml_logger.cpp.o.d"
   "CMakeFiles/bind.dir/src/xml_reader.cpp.o"
   "CMakeFiles/bind.dir/src/xml_reader.cpp.o.d"
-  "bind.cpython-310-x86_64-linux-gnu.so"
+  "bind.cpython-311-x86_64-linux-gnu.so"
   "bind.pdb"
 )
 

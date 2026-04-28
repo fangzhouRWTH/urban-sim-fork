@@ -107,3 +107,26 @@ class UrbanSceneCfg:
     """
     area size. Default is None.
     """
+
+    terrain_uv_tile_size_m: float = 1.0
+    """
+    World-space UV tiling size for procedurally generated ground meshes, in meters.
+    A value of 1.0 means one texture tile repeats every meter.
+    """
+
+    random_env_static_asset_max_planar_extent_m: float = 4.0
+    """
+    Maximum allowed scaled planar extent for static assets sampled by the limited random scene generator.
+    Assets larger than this are skipped to avoid oversized props dominating small scenes.
+    """
+
+    random_env_static_asset_max_height_m: float = 6.0
+    """
+    Maximum allowed scaled height for static assets sampled by the limited random scene generator.
+    """
+
+    random_env_static_asset_max_xy_offset_m: float = 4.0
+    """
+    Maximum allowed absolute XY placement offset from the sampled anchor position for random-scene static assets.
+    Large legacy calibration offsets can push props far away from their intended spawn point.
+    """

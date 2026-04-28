@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import torch
 import random
+import math
 from collections.abc import Sequence
 import trimesh
 from shapely.geometry import Polygon, MultiPolygon, Point
@@ -225,6 +226,92 @@ class UrbanScene(InteractiveScene):
         except Exception as e:
             super(UrbanScene, self).__init__(self.cfg)
             self.use_dynamic_pedestrians = False
+
+    @staticmethod
+    def _quat_multiply_wxyz(lhs: tuple[float, float, float, float], rhs: tuple[float, float, float, float]) -> tuple[float, float, float, float]:
+        """Compose two quaternions stored in wxyz order."""
+        lw, lx, ly, lz = lhs
+        rw, rx, ry, rz = rhs
+        return (
+            lw * rw - lx * rx - ly * ry - lz * rz,
+            lw * rx + lx * rw + ly * rz - lz * ry,
+            lw * ry - lx * rz + ly * rw + lz * rx,
+            lw * rz + lx * ry - ly * rx + lz * rw,
+        )
+
+    def _static_object_orientation_wxyz(self, obj_info: dict[str, Any]) -> tuple[float, float, float, float]:
+        """Apply the per-asset heading correction on top of the base glTF-to-USD orientation."""
+        base_quat = (math.sqrt(0.5), math.sqrt(0.5), 0.0, 0.0)
+        heading_offset_deg = float(obj_info.get("hshift", 0.0) or 0.0)
+        if abs(heading_offset_deg) < 1e-6:
+            return base_quat
+
+        half_heading = math.radians(heading_offset_deg) * 0.5
+        yaw_quat = (math.cos(half_heading), 0.0, 0.0, math.sin(half_heading))
+        quat = self._quat_multiply_wxyz(yaw_quat, base_quat)
+        quat_norm = math.sqrt(sum(component * component for component in quat))
+        if quat_norm <= 1e-8:
+            return base_quat
+        return tuple(component / quat_norm for component in quat)
+
+    @staticmethod
+    def _static_object_spawn_position(
+        anchor_x: float,
+        anchor_y: float,
+        base_z: float,
+        obj_info: dict[str, Any],
+    ) -> tuple[float, float, float]:
+        """Convert a sampled anchor point into the calibrated spawn pose for the asset."""
+        return (
+            anchor_x + float(obj_info.get("pos0", 0.0) or 0.0),
+            anchor_y + float(obj_info.get("pos1", 0.0) or 0.0),
+            base_z + float(obj_info.get("pos2", 0.0) or 0.0),
+        )
+
+    @staticmethod
+    def _static_object_planar_metrics(obj_info: dict[str, Any]) -> tuple[float, float, float]:
+        """Return scaled planar extent, scaled height, and XY offset magnitude for an asset."""
+        general_info = obj_info.get("general", {}) if isinstance(obj_info, dict) else {}
+        length = float(obj_info.get("length", general_info.get("length", 0.0)) or 0.0)
+        width = float(obj_info.get("width", general_info.get("width", 0.0)) or 0.0)
+        height = float(obj_info.get("height", general_info.get("height", 0.0)) or 0.0)
+        scale = float(obj_info.get("scale", 1.0) or 1.0)
+        pos0 = float(obj_info.get("pos0", 0.0) or 0.0)
+        pos1 = float(obj_info.get("pos1", 0.0) or 0.0)
+        return max(length, width) * scale, height * scale, max(abs(pos0), abs(pos1))
+
+    def _is_reasonable_random_env_static_asset(self, obj_info: dict[str, Any]) -> bool:
+        """Filter out asset calibrations that are implausible for the small random_env scene footprint."""
+        planar_extent, scaled_height, xy_offset = self._static_object_planar_metrics(obj_info)
+        max_planar_extent = float(getattr(self.cfg, "random_env_static_asset_max_planar_extent_m", 4.0))
+        max_height = float(getattr(self.cfg, "random_env_static_asset_max_height_m", 6.0))
+        max_xy_offset = float(getattr(self.cfg, "random_env_static_asset_max_xy_offset_m", 4.0))
+        return planar_extent <= max_planar_extent and scaled_height <= max_height and xy_offset <= max_xy_offset
+
+    def _filter_random_env_static_asset_pool(self, proto_prim_paths: list[list[Any]]) -> list[list[Any]]:
+        """Keep only static assets whose scale and calibration offsets fit the random_env layout."""
+        filtered_proto_prim_paths = []
+        rejected_assets = []
+        for proto_prim_path, obj_info in proto_prim_paths:
+            if self._is_reasonable_random_env_static_asset(obj_info):
+                filtered_proto_prim_paths.append([proto_prim_path, obj_info])
+            else:
+                rejected_assets.append(proto_prim_path.rsplit("/", maxsplit=1)[-1])
+
+        if filtered_proto_prim_paths:
+            if rejected_assets and not hasattr(self, "_random_env_asset_filter_logged"):
+                sample_assets = ", ".join(rejected_assets[:5])
+                print(
+                    "[INFO] Filtered"
+                    f" {len(rejected_assets)} oversized or mis-calibrated static assets from the random_env pool"
+                    f" (examples: {sample_assets})."
+                )
+                self._random_env_asset_filter_logged = True
+            return filtered_proto_prim_paths
+
+        if rejected_assets:
+            print("[Warning] Static asset filter rejected the entire random_env pool. Falling back to the unfiltered asset list.")
+        return proto_prim_paths
     
     def _add_entities_from_cfg(self, procedural_generation=False):
         """Add scene entities from the config."""
@@ -703,6 +790,7 @@ class UrbanScene(InteractiveScene):
     def generate_limited_sync_procedural_scene(self):
         generation_cfg = self.cfg.pg_config
         area_size = generation_cfg['map_region']
+        terrain_uv_tile_size_m = getattr(self.cfg, "terrain_uv_tile_size_m", 1.0)
         torch.manual_seed(generation_cfg['seed'])
         np.random.seed(generation_cfg['seed'])
         random.seed(generation_cfg['seed'])
@@ -776,13 +864,14 @@ class UrbanScene(InteractiveScene):
                 combined_mesh = trimesh.util.concatenate(mesh_list)
                 
                 # uv for texturing
-                combined_mesh = uv_texturing(combined_mesh, scale=UV_SCLAE)
+                combined_mesh = uv_texturing(combined_mesh, tile_size_m=terrain_uv_tile_size_m)
                 self.walkable_terrain_list[i].import_mesh('mesh', combined_mesh)
                 sim_utils.bind_visual_material(f'/World/Walkable_{i:03d}', f'/World/Looks/terrain_walkable_material_list_{i:03d}')
                 sim_utils.bind_physics_material(f'/World/Walkable_{i:03d}', f'/World/Looks/terrain_non_walkable_material_list_{i:03d}')
                 stage = omni.usd.get_context().get_stage()
                 prim = stage.GetPrimAtPath(Sdf.Path(f'/World/Walkable_{i:03d}/Environment'))
-                prim.SetActive(False)
+                if prim and prim.IsValid():
+                    prim.SetActive(False)
                 
             for i in range(len(all_region_polygon_list)):
                 mesh_list = all_region_polygon_list[i]
@@ -791,28 +880,32 @@ class UrbanScene(InteractiveScene):
                 combined_mesh = trimesh.util.concatenate(mesh_list)
                 
                 # uv for texturing
-                combined_mesh = uv_texturing(combined_mesh, scale=UV_SCLAE)
+                combined_mesh = uv_texturing(combined_mesh, tile_size_m=terrain_uv_tile_size_m)
                 self.all_region_list[i].import_mesh('mesh', combined_mesh)
                 sim_utils.bind_visual_material(f'/World/NonWalkable_{i:03d}', f'/World/Looks/terrain_non_walkable_material_list_{i:03d}')
                 sim_utils.bind_physics_material(f'/World/NonWalkable_{i:03d}', f'/World/Looks/terrain_non_walkable_material_list_{i:03d}')
                 prim = stage.GetPrimAtPath(Sdf.Path(f'/World/NonWalkable_{i:03d}/Environment'))
-                prim.SetActive(False)
+                if prim and prim.IsValid():
+                    prim.SetActive(False)
             
             # Remove ground plane
             for i in range(max(len(self.all_region_list), len(self.walkable_terrain_list))):
                 try:
                     prim = stage.GetPrimAtPath(Sdf.Path(f'/World/NonWalkable_{i:03d}/Environment'))
-                    prim.SetActive(False)
+                    if prim and prim.IsValid():
+                        prim.SetActive(False)
                 except:
                     pass
                 
                 try:
                     prim = stage.GetPrimAtPath(Sdf.Path(f'/World/Walkable_{i:03d}/Environment'))
-                    prim.SetActive(False)
+                    if prim and prim.IsValid():
+                        prim.SetActive(False)
                 except:
                     pass
             prim = stage.GetPrimAtPath(Sdf.Path(f'/World/ground/Environment'))
-            prim.SetActive(False)
+            if prim and prim.IsValid():
+                prim.SetActive(False)
             
         # static objects
         if generation_cfg['type'] == 'static' or  generation_cfg['type'] == 'dynamic':
@@ -968,24 +1061,37 @@ class UrbanScene(InteractiveScene):
                 proto_prim_paths_no_building = [p for p in proto_prim_paths if 'building' not in p[0].lower()]
                 proto_prim_paths_no_building = [p for p in proto_prim_paths_no_building if 'tree' not in p[0].lower()]
                 proto_prim_paths_no_building = [p for p in proto_prim_paths_no_building if 'wall' not in p[0].lower()]
+                proto_prim_paths_no_building = self._filter_random_env_static_asset_pool(proto_prim_paths_no_building)
+                pool_size = len(proto_prim_paths_no_building)
                 for obj_idx, pos in enumerate(object_positions):
-                    proto_prim_path_i = np.random.choice([i for i in range(len(proto_prim_paths_no_building))])
-                    if not hasattr(self, 'random_p_list'):
+                    if (
+                        not hasattr(self, 'random_p_list')
+                        or getattr(self, 'random_p_pool_size', None) != pool_size
+                        or len(self.random_p_list) != 1
+                        or len(self.random_p_list[0]) != len(object_positions)
+                    ):
                         self.random_p_list = [
                             [
-                                np.random.choice([i for i in range(len(proto_prim_paths_no_building))]) for _ in range(len(object_positions))
+                                np.random.choice([i for i in range(pool_size)]) for _ in range(len(object_positions))
                             ] for _ in range(1)
                         ]
+                        self.random_p_pool_size = pool_size
                     proto_prim_path_i = self.random_p_list[env_idx % 1][obj_idx]
                     proto_prim_path = proto_prim_paths_no_building[proto_prim_path_i]
                     prim_path = proto_prim_path[0].replace('/World/Dataset/Object_', '')
                     obj_info = proto_prim_path[1]
                     prim_path=f"/World/envs/env_{env_idx}/" + f"Object_{prim_path}" + f'{obj_idx:04d}'
-                    obj_prim_path_list.append([prim_path, (pos[0] - tmp_origin[env_idx, 0] + obj_info['pos0'],pos[1] - tmp_origin[env_idx, 1] + obj_info['pos1'], mesh_block_height + obj_info['pos2']), (0.707, 0.707,0.0,0.0)])
+                    object_position = self._static_object_spawn_position(
+                        pos[0] - tmp_origin[env_idx, 0],
+                        pos[1] - tmp_origin[env_idx, 1],
+                        mesh_block_height,
+                        obj_info,
+                    )
+                    obj_prim_path_list.append([prim_path, object_position, self._static_object_orientation_wxyz(obj_info)])
                     prim_path_list.append(prim_path)
                     obj_position_list.append(
                         [
-                            pos[0] - tmp_origin[env_idx, 0] + obj_info['pos0'],pos[1] - tmp_origin[env_idx, 1] + obj_info['pos1']
+                            object_position[0], object_position[1]
                         ]
                     )
                 asset_position_list.append(obj_position_list)
@@ -1150,13 +1256,16 @@ class UrbanScene(InteractiveScene):
         # deactivate some prims
         stage = omni.usd.get_context().get_stage()
         prim = stage.GetPrimAtPath(Sdf.Path(f'/World/ground/Environment'))
-        prim.SetActive(False)
+        if prim and prim.IsValid():
+            prim.SetActive(False)
         prim = stage.GetPrimAtPath(Sdf.Path(f'/World/Obstacle_terrain/Environment'))
-        prim.SetActive(False)
+        if prim and prim.IsValid():
+            prim.SetActive(False)
         
     def generate_limited_async_procedural_scene(self):
         generation_cfg = self.cfg.pg_config
         area_size = generation_cfg['map_region']
+        terrain_uv_tile_size_m = getattr(self.cfg, "terrain_uv_tile_size_m", 1.0)
         torch.manual_seed(generation_cfg['seed'])
         np.random.seed(generation_cfg['seed'])
         random.seed(generation_cfg['seed'])
@@ -1230,13 +1339,14 @@ class UrbanScene(InteractiveScene):
                 combined_mesh = trimesh.util.concatenate(mesh_list)
                 
                 # uv for texturing
-                combined_mesh = uv_texturing(combined_mesh, scale=UV_SCLAE)
+                combined_mesh = uv_texturing(combined_mesh, tile_size_m=terrain_uv_tile_size_m)
                 self.walkable_terrain_list[i].import_mesh('mesh', combined_mesh)
                 sim_utils.bind_visual_material(f'/World/Walkable_{i:03d}', f'/World/Looks/terrain_walkable_material_list_{i:03d}')
                 sim_utils.bind_physics_material(f'/World/Walkable_{i:03d}', f'/World/Looks/terrain_non_walkable_material_list_{i:03d}')
                 stage = omni.usd.get_context().get_stage()
                 prim = stage.GetPrimAtPath(Sdf.Path(f'/World/Walkable_{i:03d}/Environment'))
-                prim.SetActive(False)
+                if prim and prim.IsValid():
+                    prim.SetActive(False)
                 
             for i in range(len(all_region_polygon_list)):
                 mesh_list = all_region_polygon_list[i]
@@ -1245,28 +1355,32 @@ class UrbanScene(InteractiveScene):
                 combined_mesh = trimesh.util.concatenate(mesh_list)
                 
                 # uv for texturing
-                combined_mesh = uv_texturing(combined_mesh, scale=UV_SCLAE)
+                combined_mesh = uv_texturing(combined_mesh, tile_size_m=terrain_uv_tile_size_m)
                 self.all_region_list[i].import_mesh('mesh', combined_mesh)
                 sim_utils.bind_visual_material(f'/World/NonWalkable_{i:03d}', f'/World/Looks/terrain_non_walkable_material_list_{i:03d}')
                 sim_utils.bind_physics_material(f'/World/NonWalkable_{i:03d}', f'/World/Looks/terrain_non_walkable_material_list_{i:03d}')
                 prim = stage.GetPrimAtPath(Sdf.Path(f'/World/NonWalkable_{i:03d}/Environment'))
-                prim.SetActive(False)
+                if prim and prim.IsValid():
+                    prim.SetActive(False)
             
             # Remove ground plane
             for i in range(max(len(self.all_region_list), len(self.walkable_terrain_list))):
                 try:
                     prim = stage.GetPrimAtPath(Sdf.Path(f'/World/NonWalkable_{i:03d}/Environment'))
-                    prim.SetActive(False)
+                    if prim and prim.IsValid():
+                        prim.SetActive(False)
                 except:
                     pass
                 
                 try:
                     prim = stage.GetPrimAtPath(Sdf.Path(f'/World/Walkable_{i:03d}/Environment'))
-                    prim.SetActive(False)
+                    if prim and prim.IsValid():
+                        prim.SetActive(False)
                 except:
                     pass
             prim = stage.GetPrimAtPath(Sdf.Path(f'/World/ground/Environment'))
-            prim.SetActive(False)
+            if prim and prim.IsValid():
+                prim.SetActive(False)
             
         # static objects
         if generation_cfg['type'] == 'static' or  generation_cfg['type'] == 'dynamic':
@@ -1471,24 +1585,37 @@ class UrbanScene(InteractiveScene):
                 proto_prim_paths_no_building = [p for p in proto_prim_paths if 'building' not in p[0].lower()]
                 proto_prim_paths_no_building = [p for p in proto_prim_paths_no_building if 'tree' not in p[0].lower()]
                 proto_prim_paths_no_building = [p for p in proto_prim_paths_no_building if 'wall' not in p[0].lower()]
+                proto_prim_paths_no_building = self._filter_random_env_static_asset_pool(proto_prim_paths_no_building)
+                pool_size = len(proto_prim_paths_no_building)
                 for obj_idx, pos in enumerate(object_positions):
-                    proto_prim_path_i = np.random.choice([i for i in range(len(proto_prim_paths_no_building))])
-                    if not hasattr(self, 'random_p_list'):
+                    if (
+                        not hasattr(self, 'random_p_list')
+                        or getattr(self, 'random_p_pool_size', None) != pool_size
+                        or len(self.random_p_list) != generation_cfg['unique_env_num']
+                        or any(len(random_p) != len(object_positions) for random_p in self.random_p_list)
+                    ):
                         self.random_p_list = [
                             [
-                                np.random.choice([i for i in range(len(proto_prim_paths_no_building))]) for _ in range(len(object_positions))
+                                np.random.choice([i for i in range(pool_size)]) for _ in range(len(object_positions))
                             ] for _ in range(generation_cfg['unique_env_num'])
                         ]
+                        self.random_p_pool_size = pool_size
                     proto_prim_path_i = self.random_p_list[env_idx % generation_cfg['unique_env_num']][obj_idx]
                     proto_prim_path = proto_prim_paths_no_building[proto_prim_path_i]
                     prim_path = proto_prim_path[0].replace('/World/Dataset/Object_', '')
                     obj_info = proto_prim_path[1]
                     prim_path=f"/World/envs/env_{env_idx}/" + f"Object_{prim_path}" + f'{obj_idx:04d}'
-                    obj_prim_path_list.append([prim_path, (pos[0] - tmp_origin[env_idx, 0] + obj_info['pos0'],pos[1] - tmp_origin[env_idx, 1] + obj_info['pos1'], mesh_block_height + obj_info['pos2']), (0.707, 0.707,0.0,0.0)])
+                    object_position = self._static_object_spawn_position(
+                        pos[0] - tmp_origin[env_idx, 0],
+                        pos[1] - tmp_origin[env_idx, 1],
+                        mesh_block_height,
+                        obj_info,
+                    )
+                    obj_prim_path_list.append([prim_path, object_position, self._static_object_orientation_wxyz(obj_info)])
                     prim_path_list.append(prim_path)
                     obj_position_list.append(
                         [
-                            pos[0] - tmp_origin[env_idx, 0] + obj_info['pos0'],pos[1] - tmp_origin[env_idx, 1] + obj_info['pos1']
+                            object_position[0], object_position[1]
                         ]
                     )
                 asset_position_list.append(obj_position_list)
@@ -1654,9 +1781,11 @@ class UrbanScene(InteractiveScene):
         # deactivate some prims
         stage = omni.usd.get_context().get_stage()
         prim = stage.GetPrimAtPath(Sdf.Path(f'/World/ground/Environment'))
-        prim.SetActive(False)
+        if prim and prim.IsValid():
+            prim.SetActive(False)
         prim = stage.GetPrimAtPath(Sdf.Path(f'/World/Obstacle_terrain/Environment'))
-        prim.SetActive(False)
+        if prim and prim.IsValid():
+            prim.SetActive(False)
         
     def generate_sync_procedural_scene(self):
         from metaurban.manager.traffic_manager import TrafficMode
@@ -1900,25 +2029,35 @@ class UrbanScene(InteractiveScene):
             
             stage = omni.usd.get_context().get_stage()
             prim = stage.GetPrimAtPath(Sdf.Path(f'/World/ground/Environment'))
-            prim.SetActive(False)
+            if prim and prim.IsValid():
+                prim.SetActive(False)
             prim = stage.GetPrimAtPath(Sdf.Path(f'/World/Lane/Environment'))
-            prim.SetActive(False)
+            if prim and prim.IsValid():
+                prim.SetActive(False)
             prim = stage.GetPrimAtPath(Sdf.Path(f'/World/WhiteLine/Environment'))
-            prim.SetActive(False)
+            if prim and prim.IsValid():
+                prim.SetActive(False)
             prim = stage.GetPrimAtPath(Sdf.Path(f'/World/YellowLine/Environment'))
-            prim.SetActive(False)
+            if prim and prim.IsValid():
+                prim.SetActive(False)
             prim = stage.GetPrimAtPath(Sdf.Path(f'/World/Sidewalk/Environment'))
-            prim.SetActive(False)
+            if prim and prim.IsValid():
+                prim.SetActive(False)
             prim = stage.GetPrimAtPath(Sdf.Path(f'/World/NearRoad/Environment'))
-            prim.SetActive(False)
+            if prim and prim.IsValid():
+                prim.SetActive(False)
             prim = stage.GetPrimAtPath(Sdf.Path(f'/World/NearBuffer/Environment'))
-            prim.SetActive(False)
+            if prim and prim.IsValid():
+                prim.SetActive(False)
             prim = stage.GetPrimAtPath(Sdf.Path(f'/World/FarFromBuffer/Environment'))
-            prim.SetActive(False)
+            if prim and prim.IsValid():
+                prim.SetActive(False)
             prim = stage.GetPrimAtPath(Sdf.Path(f'/World/FarFromRoad/Environment'))
-            prim.SetActive(False)
+            if prim and prim.IsValid():
+                prim.SetActive(False)
             prim = stage.GetPrimAtPath(Sdf.Path(f'/World/HouseRegion/Environment'))
-            prim.SetActive(False)
+            if prim and prim.IsValid():
+                prim.SetActive(False)
          
     def generate_async_procedural_scene(self):
         from metaurban.manager.traffic_manager import TrafficMode
@@ -2057,25 +2196,36 @@ class UrbanScene(InteractiveScene):
             
             stage = omni.usd.get_context().get_stage()
             prim = stage.GetPrimAtPath(Sdf.Path(f'/World/ground/Environment'))
-            prim.SetActive(False)
+            if prim and prim.IsValid():
+                prim.SetActive(False)
             prim = stage.GetPrimAtPath(Sdf.Path(f'/World/Lane/Environment'))
-            prim.SetActive(False)
+            if prim and prim.IsValid():
+                prim.SetActive(False)
             prim = stage.GetPrimAtPath(Sdf.Path(f'/World/WhiteLine/Environment'))
-            prim.SetActive(False)
+            if prim and prim.IsValid():
+                prim.SetActive(False)
             prim = stage.GetPrimAtPath(Sdf.Path(f'/World/YellowLine/Environment'))
-            prim.SetActive(False)
+            if prim and prim.IsValid():
+                prim.SetActive(False)
             prim = stage.GetPrimAtPath(Sdf.Path(f'/World/Sidewalk/Environment'))
-            prim.SetActive(False)
+            if prim and prim.IsValid():
+                prim.SetActive(False)
             prim = stage.GetPrimAtPath(Sdf.Path(f'/World/NearRoad/Environment'))
-            prim.SetActive(False)
+            
+            if prim and prim.IsValid():
+                prim.SetActive(False)
             prim = stage.GetPrimAtPath(Sdf.Path(f'/World/NearBuffer/Environment'))
-            prim.SetActive(False)
+            if prim and prim.IsValid():
+                prim.SetActive(False)
             prim = stage.GetPrimAtPath(Sdf.Path(f'/World/FarFromBuffer/Environment'))
-            prim.SetActive(False)
+            if prim and prim.IsValid():
+                prim.SetActive(False)
             prim = stage.GetPrimAtPath(Sdf.Path(f'/World/FarFromRoad/Environment'))
-            prim.SetActive(False)
+            if prim and prim.IsValid():
+                prim.SetActive(False)
             prim = stage.GetPrimAtPath(Sdf.Path(f'/World/HouseRegion/Environment'))
-            prim.SetActive(False)
+            if prim and prim.IsValid():
+                prim.SetActive(False)
     
     def setup_object_dict(self):
         if self._is_scene_setup_from_cfg():
@@ -2374,12 +2524,13 @@ class UrbanScene(InteractiveScene):
                 continue
             prim_path = asset_path[:-5].replace('-', '_')
             prim_path=f"/World/envs/env_.*/" + f"Object_{prim_path}" + f'{obj_idx:04d}'
+            object_position = self._static_object_spawn_position(position[0], position[1], LANE_HEIGHT + 0.02, obj)
             # prim path in the sub env & init pos & init rot
-            obj_prim_path_list.append([prim_path, usd_path, (position[0]+obj['pos0'],position[1]+obj['pos1'], LANE_HEIGHT + 0.02), (0.707, 0.707,0.0,0.0), obj['scale'], (position[0],position[1], LANE_HEIGHT + 0.02)])
+            obj_prim_path_list.append([prim_path, usd_path, object_position, self._static_object_orientation_wxyz(obj), obj['scale'], (position[0],position[1], LANE_HEIGHT + 0.02)])
             prim_path_list.append(prim_path)
             obj_position_list.append(
                 [
-                    position[0]+obj['pos0'],position[1]+obj['pos1']
+                    object_position[0], object_position[1]
                 ]
             )
             
@@ -2414,12 +2565,13 @@ class UrbanScene(InteractiveScene):
                 continue
             prim_path = asset_path[:-5].replace('-', '_')
             prim_path=f"/World/envs/env_{engine_idx}/" + f"Object_{prim_path}" + f'{obj_idx:04d}'
+            object_position = self._static_object_spawn_position(position[0], position[1], LANE_HEIGHT + 0.02, obj)
             # prim path in the sub env & init pos & init rot
-            obj_prim_path_list.append([prim_path, (position[0]+obj['pos0'],position[1]+obj['pos1'], LANE_HEIGHT + 0.02), (0.707, 0.707,0.0,0.0)])
+            obj_prim_path_list.append([prim_path, object_position, self._static_object_orientation_wxyz(obj)])
             prim_path_list.append(prim_path)
             obj_position_list.append(
                 [
-                    position[0]+obj['pos0'],position[1]+obj['pos1']
+                    object_position[0], object_position[1]
                 ]
             )
             
