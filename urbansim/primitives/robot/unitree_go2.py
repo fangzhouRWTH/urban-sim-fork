@@ -132,7 +132,10 @@ class GO2NavActionsCfg:
     )
 
 def GO2NavModifyEnv(env):
-    env.terminations.collision_term_concat.params['sensor_cfg'].body_names = ["base", ".*_thigh"]
+    if hasattr(env.terminations, "collision_term_concat"):
+        env.terminations.collision_term_concat.params["sensor_cfg"].body_names = ["base", ".*_thigh"]
+    if hasattr(env.terminations, "collision"):
+        env.terminations.collision.params["sensor_cfg"].body_names = ["base", ".*_thigh"]
     return env
 
 # ============================
